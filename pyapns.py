@@ -2,14 +2,14 @@
 
 # pyapns is distributed under the terms of the MIT license.
 # 
+# Copyright (c) 2013 najeira
+# <https://github.com/najeira/pyapns>
+# 
 # Copyright (c) 2011 Goo Software Ltd
 # <https://github.com/djacobs/PyAPNs>
 # 
-# Copyright (c) Max Klymyshyn, Sonettic
+# Copyright (c) 2010 Max Klymyshyn, Sonettic
 # <https://pypi.python.org/pypi/APNSWrapper/>
-# 
-# Copyright (c) 2013 najeira
-# <https://github.com/najeira/pyapns>
 # 
 # Permission is hereby granted, free of charge, to any person obtaining a copy of
 # this software and associated documentation files (the "Software"), to deal in
@@ -27,6 +27,7 @@
 # COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 # IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 
 import binascii
 import datetime
@@ -325,6 +326,9 @@ class GatewayConnection(APNsConnection):
     rfds, wfds, efds = None, None, None
     cnt_tokens = len(tokens)
     index = 0
+    
+    succeededs = []
+    failures = {}
 
     while index < cnt_tokens:
       
@@ -343,14 +347,15 @@ class GatewayConnection(APNsConnection):
         self.send_notification_to_token(notification, token_hex)
         index += 1
       
-      try:
-        self.check_error()
-      except GatewayError as ex:
-        print repr(ex)
-        self.disconnect()
-        rfds, wfds, efds = None, None, None
+        try:
+          self.check_error()
+          succeededs.append(token_hex)
+        except GatewayError as ex:
+          failures[token_hex] = ex
+          self.disconnect()
+          rfds, wfds, efds = None, None, None
     
-    return index
+    return succeededs, failures
   
   def check_error(self):
     ready_to_read, ready_to_write, in_error = select.select(
@@ -364,7 +369,6 @@ class GatewayConnection(APNsConnection):
   def send_notification_to_token(self, notification, token_hex):
     msg = self.message(notification, token_hex)
     self.write(msg)
-    print token_hex
   
   def message(self, notification, token_hex):
     data = [self.item_device_token(utf8(token_hex)),
