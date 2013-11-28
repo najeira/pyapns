@@ -7,14 +7,12 @@ A library for Apple Push Notification Services.
 ### Sending notification
 
 ```python
-# creates a Notification object
-notification = Notification(alert="This is APNs message!")
-
-# getsa connection
+# gets a connection
 apns = APNs(use_sandbox=True, cert_file="your.cert", key_file="your.key")
 server = apns.gateway_server
 
 # sends a notification
+notification = Notification(alert="This is APNs message!")
 server.send(notification, device_tokens)
 ```
 
