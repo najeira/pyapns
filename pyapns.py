@@ -327,7 +327,6 @@ class GatewayConnection(APNsConnection):
     cnt_tokens = len(tokens)
     index = 0
     
-    succeededs = []
     failures = {}
 
     while index < cnt_tokens:
@@ -346,16 +345,19 @@ class GatewayConnection(APNsConnection):
         notification.identifier = index
         self.send_notification_to_token(notification, token_hex)
         index += 1
-      
+        
         try:
           self.check_error()
-          succeededs.append(token_hex)
         except GatewayError as ex:
-          failures[token_hex] = ex
+          if ex.status != 10:
+            failures[token_hex] = ex
+          else:
+            for failied_index in range(ex.identifier + 1, index):
+              failures[tokens[failied_index]] = ex
           self.disconnect()
           rfds, wfds, efds = None, None, None
     
-    return succeededs, failures
+    return failures
   
   def check_error(self):
     ready_to_read, ready_to_write, in_error = select.select(
