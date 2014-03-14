@@ -36,6 +36,10 @@ import socket
 import select
 import ssl
 import json
+import logging
+import collections
+import threading
+import Queue
 
 
 MAX_NOTIFICATION_LENGTH = 256
@@ -49,18 +53,6 @@ def utf8(value):
 
 class Error(Exception):
   pass
-
-
-class GatewayError(Error):
-  def __init__(self, data):
-    command, status, identifier = struct.unpack("!BBL", data)
-    self.command = command
-    self.status = status
-    self.identifier = identifier
-  
-  def __repr__(self):
-    return "%s(command=%d, status=%d, identifier=%d)" % (
-      self.__class__.__name__, self.command, self.status, self.identifier)
 
 
 class NotificationTooLargeError(Error):
@@ -270,34 +262,31 @@ class FeedbackConnection(APNsConnection):
     the APNs feedback server
     """
     buff = ""
-    rfds = [self.fileno()]
-    wfds = []
-    efds = [self.fileno()]
+    fileno = self.fileno()
+    rfds, wfds, efds = [fileno], [], [fileno]
     while True:
-      ready_to_read, ready_to_write, in_error = select.select(rfds, wfds, efds, 60)
+      ready_to_read, _, in_error = select.select(rfds, wfds, efds, 60)
       
       if len(in_error):
-        break
+        raise IOError("error")
       
       if len(ready_to_read):
         self.recv()
         data = self.read()
-        if not data:
+        if not data or len(buff) < 6:
           break
         buff += data
-        if len(buff) >= 6:
-          while len(buff) > 6:
-            token_length = struct.unpack('>H', buff[4:6])[0]
-            bytes_to_read = 6 + token_length
-            if len(buff) >= bytes_to_read:
-              fail_time_unix = struct.unpack('>I', buff[0:4])[0]
-              fail_time = datetime.datetime.utcfromtimestamp(fail_time_unix)
-              token = binascii.b2a_hex(buff[6:bytes_to_read])
-              buff = buff[bytes_to_read:]
-              yield (token, fail_time)
-      else:
-        # no data
-        break
+        while len(buff) > 6:
+          token_length = struct.unpack('>H', buff[4:6])[0]
+          bytes_to_read = 6 + token_length
+          if len(buff) >= bytes_to_read:
+            fail_time_unix = struct.unpack('>I', buff[0:4])[0]
+            fail_time = datetime.datetime.utcfromtimestamp(fail_time_unix)
+            token = binascii.b2a_hex(buff[6:bytes_to_read])
+            buff = buff[bytes_to_read:] # Remove data for current token from buffer
+            yield (token, fail_time)
+          else:
+            break # break out of inner while loop
 
 
 class GatewayConnection(APNsConnection):
@@ -309,71 +298,99 @@ class GatewayConnection(APNsConnection):
     super(GatewayConnection, self).__init__(**kwargs)
     self.server = "gateway.sandbox.push.apple.com" if use_sandbox else "gateway.push.apple.com"
     self.port = 2195
-    
-  def send(self, notification, tokens):
-    try:
-      return self._send(notification, tokens)
-    finally:
+    self.logger = None
+    self._init_sent_items()
+    self._queue = Queue.Queue()
+    self._worker_thread = None
+  
+  def put(self, notification, tokens):
+    item = (notification, tokens, )
+    self._queue.put(item)
+    self._log(logging.DEBUG, "put: %r, %r" % item)
+    self._start()
+  
+  def join(self):
+    self._queue.put(None)
+    if self._worker_thread:
+      self._worker_thread.join()
+      self._worker_thread = None
+  
+  def _log(self, level, msg, *args, **kwargs):
+    if self.logger:
+      self.logger.log(level, msg, *args, **kwargs)
+  
+  def _init_sent_items(self):
+    self._identifiler = 1
+    self._sent_items = []
+  
+  def _start(self):
+    if self._worker_thread:
+      if not self._worker_thread.is_alive:
+        self._worker_thread = None
+    if not self._worker_thread:
+      self._worker_thread = threading.Thread(target=self._run_worker)
+      self._worker_thread.daemon = True
+      self._worker_thread.start()
+      self._log(logging.DEBUG, "thread start")
+  
+  def _run_worker(self):
+    item = self._queue.get()
+    while item:
       try:
+        self._send(item[0], item[1])
+      except (socket.error, IOError) as ex:
+        self._log(logging.ERROR, ex, exc_info=1)
         self.disconnect()
-      except Exception:
-        pass
+        self._init_sent_items()
+      item = self._queue.get()
+    self.disconnect()
   
-  def _send(self, notification, tokens):
-    if isinstance(tokens, basestring):
-      tokens = [tokens]
-    
-    rfds, wfds, efds = None, None, None
-    cnt_tokens = len(tokens)
-    index = 0
-    
-    failures = {}
-
-    while index < cnt_tokens:
-      
-      if not wfds:
-        fileno = self.fileno()
-        rfds, wfds, efds = [], [fileno], [fileno]
-      
-      _, ready_to_write, in_error = select.select(rfds, wfds, efds, 60)
-      
-      if len(in_error):
+  def _send(self, notification, token):
+    fileno = self.fileno()
+    rfds, wfds, efds = [fileno], [fileno], [fileno]
+    while True:
+      ready_to_read, ready_to_write, in_error = select.select(rfds, wfds, efds, 60)
+      if in_error:
+        raise IOError("error")
+      if ready_to_read:
+        self._ready_to_read()
+      if ready_to_write:
+        self._ready_to_write(notification, token)
+        self._log(logging.DEBUG, "sent")
         break
-      
-      if len(ready_to_write):
-        token_hex = tokens[index]
-        notification.identifier = index
-        self.send_notification_to_token(notification, token_hex)
-        index += 1
-        
-        try:
-          self.check_error()
-        except GatewayError as ex:
-          if ex.status != 10:
-            failures[token_hex] = ex
-          else:
-            for failied_index in range(ex.identifier + 1, index):
-              failures[tokens[failied_index]] = ex
-          self.disconnect()
-          rfds, wfds, efds = None, None, None
+  
+  def _ready_to_write(self, notification, token):
+    notification.identifier = self._identifiler
+    self._send_notification_to_token(notification, token)
+    self._sent_items.append((notification, token, ))
+    assert self._identifiler == len(self._sent_items)
+    self._identifiler += 1
+  
+  def _ready_to_read(self):
+    self.recv()
+    data = self.read()
+    if not data or len(data) < 6:
+      return
     
-    return failures
+    command, status, identifier = struct.unpack("!BBL", data)
+    if command != 8:
+      raise IOError("APNs error: unknown command %d" % command)
+    
+    if identifier == 0:
+      raise IOError("APNs error: invalid identifier")
+    
+    for index in xrange(identifier, len(self._sent_items)):
+      item = self._sent_items[index]
+      self.put(item[0], item[1])
+    
+    raise IOError("APNs error: status is %d" % status)
   
-  def check_error(self):
-    ready_to_read, ready_to_write, in_error = select.select(
-      [self.fileno()], [], [], 1)
-    if len(ready_to_read):
-      self.recv()
-      data = self.read()
-      if data and len(data) >= 6:
-        raise GatewayError(data)
-  
-  def send_notification_to_token(self, notification, token_hex):
-    msg = self.message(notification, token_hex)
+  def _send_notification_to_token(self, notification, token_hex):
+    msg = self._build_message(notification, token_hex)
     self.write(msg)
   
-  def message(self, notification, token_hex):
-    data = [self.item_device_token(utf8(token_hex)),
+  def _build_message(self, notification, token_hex):
+    data = [self._item_device_token(utf8(token_hex)),
       notification.item_payload()]
     for f in (notification.item_identifier,
               notification.item_expiration,
@@ -385,7 +402,7 @@ class GatewayConnection(APNsConnection):
     len_str = struct.pack(">I", len(data)) # 4 bytes
     return "\2" + len_str + data
   
-  def item_device_token(self, token_hex):
+  def _item_device_token(self, token_hex):
     token_bin = binascii.a2b_hex(token_hex)
     len_str = struct.pack(">H", len(token_bin)) # 2 bytes
     return "\1" + len_str + token_bin
