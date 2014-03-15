@@ -63,8 +63,7 @@ class NotificationTooLargeError(Error):
 
 
 class GatewayError(IOError):
-  def __init__(self, data):
-    command, status, identifier = struct.unpack("!BBL", data)
+  def __init__(self, command, status, identifier):
     self.command = command
     self.status = status
     self.identifier = identifier
@@ -127,8 +126,6 @@ class APNsConnection(object):
     self.disconnect()
 
   def _connect(self):
-    assert self.server
-    assert self.port
     self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     self._socket.connect((self.server, self.port))
     self._ssl = ssl.wrap_socket(self._socket, self.key_file, self.cert_file)
@@ -160,14 +157,17 @@ class APNsConnection(object):
     self._read_buffer = []
     return data
   
-  def _recv(self, n=4096):
+  def recv(self, n=4096):
     self.ensure_connect()
     if self._ssl:
       return self._ssl.read(n)
     return self._socket.recv(n)
 
-  def recv(self, n=4096):
-    self._read_buffer.append(self._recv(n))
+  def recv_to_buffer(self, n=4096):
+    chunk = self._recv(n)
+    if not chunk:
+      raise IOError("closed")
+    self._read_buffer.append(chunk)
 
   def write(self, string):
     return self.connection().write(string)
@@ -292,7 +292,7 @@ class FeedbackConnection(APNsConnection):
         raise IOError("error")
       
       if len(ready_to_read):
-        self.recv()
+        self.recv_to_buffer()
         data = self.read()
         if not data or len(buff) < 6:
           break
@@ -320,14 +320,14 @@ class GatewayConnection(APNsConnection):
     self.server = "gateway.sandbox.push.apple.com" if use_sandbox else "gateway.push.apple.com"
     self.port = 2195
     self.logger = None
-    self._identifiler = 1
+    self._identifiler = 0
     self._sent_items = {}
     self._queue = Queue.Queue()
     self._worker_thread = None
   
-  def put(self, notification, tokens):
-    self._queue.put((notification, tokens, ))
-    self._log(logging.DEBUG, "put: %r, %r" % (notification, tokens, ))
+  def put(self, notification, token):
+    self._queue.put((notification, token, ))
+    self._log(logging.DEBUG, "put")
     self._start()
   
   def join(self):
@@ -369,65 +369,63 @@ class GatewayConnection(APNsConnection):
   
   def _handle_gateway_error(self, error):
     self.disconnect()
-    if error.command == 8 and error.status != 10 and error.identifier != 0:
-      invalid_item = self._sent_items.get(ge.identifier)
+    if error.command == 8 and error.identifier != 0:
+      invalid_item = self._sent_items.get(error.identifier)
       if invalid_item:
         self._log(logging.INFO, "invalid token: %s" % invalid_item[1])
-      self._retry_from(ge.identifier + 1)
+      self._retry_from(error.identifier + 1)
     else:
       self._log(logging.WARN, "unknown error: %r" % error)
 
   def _handle_ioerror(self, error):
     self.disconnect()
-    self._log(logging.WARN, error, exc_info=1)
+    self._log(logging.WARN, error)
 
   def _send(self, notification, token):
+    self._identifiler += 1
+    notification.identifier = self._identifiler
+    self._put_sent_item(notification, token)
+    msg = self._build_message(notification, token)
     fileno = self.fileno()
     rfds, wfds, efds = [fileno], [fileno], [fileno]
-    while True:
-      ready_to_read, ready_to_write, in_error = select.select(rfds, wfds, efds, 60)
+    while msg:
+      ready_to_read, ready_to_write, in_error = select.select(rfds, wfds, efds)
       if in_error:
         raise IOError("error")
       elif ready_to_read:
         self._ready_to_read()
       elif ready_to_write:
-        self._ready_to_write(notification, token)
-        return
+        msg = self._ready_to_write(msg)
+    self._log(logging.DEBUG, "sent")
   
   def _put_sent_item(self, notification, token):
-    self._sent_items[self._identifiler] = (notification, token, )
+    self._sent_items[notification.identifier] = (notification, token, )
     if len(self._sent_items) > self.KEEP_SENT_ITEMS_MAX:
-      self._sent_items.pop(self._identifiler - self.KEEP_SENT_ITEMS_MAX)
-
-  def _retry_last_one(self, index):
-    self._retry_from(self._identifiler)
+      self._sent_items.pop(notification.identifier - self.KEEP_SENT_ITEMS_MAX)
 
   def _retry_from(self, index):
     while index <= self._identifiler:
-      item = self._sent_items.get(index)
-      if not item:
-        break
-      self.put(item[0], item[1])
+      item = self._sent_items.pop(index, None)
+      if item:
+        self.put(item[0], item[1])
       index += 1
 
-  def _ready_to_write(self, notification, token):
-    notification.identifier = self._identifiler
-    self._put_sent_item(notification, token)
-    self._identifiler += 1
-    self._send_notification_to_token(notification, token)
-    self._log(logging.DEBUG, "sent")
+  def _ready_to_write(self, data):
+    length = self.write(data)
+    if length == len(data):
+      return None
+    return data[length:]
   
   def _ready_to_read(self):
-    self.recv()
-    if self.len_read_buffer() < 6:
+    self.recv_to_buffer()
+    length = self.len_read_buffer()
+    if length < 6:
       return
+    elif length > 6:
+      raise IOError("unknown")
     data = self.read()
-    assert len(data) >= 6
-    raise GatewayError(data)
-  
-  def _send_notification_to_token(self, notification, token_hex):
-    msg = self._build_message(notification, token_hex)
-    self.write(msg)
+    command, status, identifier = struct.unpack("!BBL", data)
+    raise GatewayError(command, status, identifier)
   
   def _build_message(self, notification, token_hex):
     data = [self._item_device_token(utf8(token_hex)),
