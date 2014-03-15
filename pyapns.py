@@ -2,8 +2,11 @@
 
 # pyapns is distributed under the terms of the MIT license.
 # 
-# Copyright (c) 2013 najeira
+# Copyright (c) 2014 najeira
 # <https://github.com/najeira/pyapns>
+# 
+# Copyright (c) 2014, VOYAGE GROUP
+# <https://github.com/voyagegroup/apns-proxy-server>
 # 
 # Copyright (c) 2011 Goo Software Ltd
 # <https://github.com/djacobs/PyAPNs>
@@ -57,6 +60,18 @@ class Error(Exception):
 
 class NotificationTooLargeError(Error):
   pass
+
+
+class GatewayError(IOError):
+  def __init__(self, data):
+    command, status, identifier = struct.unpack("!BBL", data)
+    self.command = command
+    self.status = status
+    self.identifier = identifier
+  
+  def __repr__(self):
+    return "%s(command=%d, status=%d, identifier=%d)" % (
+      self.__class__.__name__, self.command, self.status, self.identifier)
 
 
 class APNs(object):
@@ -126,25 +141,31 @@ class APNsConnection(object):
       self._read_buffer = []
   
   def ensure_connect(self):
-    if not self._ssl:
+    if not self._socket:
       self._connect()
   
   def connection(self):
     self.ensure_connect()
-    return self._ssl
+    return self._ssl or self._socket
   
   def fileno(self):
     self.ensure_connect()
     return self._socket.fileno()
   
+  def len_read_buffer(self):
+    return sum(len(b) for b in self._read_buffer)
+
   def read(self):
     data = "".join(self._read_buffer)
     self._read_buffer = []
     return data
   
   def _recv(self, n=4096):
-    return self.connection().read(n)
-  
+    self.ensure_connect()
+    if self._ssl:
+      return self._ssl.read(n)
+    return self._socket.recv(n)
+
   def recv(self, n=4096):
     self._read_buffer.append(self._recv(n))
 
@@ -299,14 +320,14 @@ class GatewayConnection(APNsConnection):
     self.server = "gateway.sandbox.push.apple.com" if use_sandbox else "gateway.push.apple.com"
     self.port = 2195
     self.logger = None
-    self._init_sent_items()
+    self._identifiler = 1
+    self._sent_items = {}
     self._queue = Queue.Queue()
     self._worker_thread = None
   
   def put(self, notification, tokens):
-    item = (notification, tokens, )
-    self._queue.put(item)
-    self._log(logging.DEBUG, "put: %r, %r" % item)
+    self._queue.put((notification, tokens, ))
+    self._log(logging.DEBUG, "put: %r, %r" % (notification, tokens, ))
     self._start()
   
   def join(self):
@@ -319,32 +340,47 @@ class GatewayConnection(APNsConnection):
     if self.logger:
       self.logger.log(level, msg, *args, **kwargs)
   
-  def _init_sent_items(self):
-    self._identifiler = 1
-    self._sent_items = []
-  
   def _start(self):
     if self._worker_thread:
       if not self._worker_thread.is_alive:
         self._worker_thread = None
     if not self._worker_thread:
-      self._worker_thread = threading.Thread(target=self._run_worker)
+      self._worker_thread = threading.Thread(target=self._run)
       self._worker_thread.daemon = True
       self._worker_thread.start()
       self._log(logging.DEBUG, "thread start")
   
-  def _run_worker(self):
+  def _run(self):
+    try:
+      self._send_loop()
+    finally:
+      self.disconnect()
+
+  def _send_loop(self):
     item = self._queue.get()
     while item:
       try:
         self._send(item[0], item[1])
-      except (socket.error, IOError) as ex:
-        self._log(logging.ERROR, ex, exc_info=1)
-        self.disconnect()
-        self._init_sent_items()
+      except GatewayError as gateway_error:
+        self._handle_gateway_error(gateway_error)
+      except (socket.error, IOError) as io_error:
+        self._handle_ioerror(io_error)
       item = self._queue.get()
-    self.disconnect()
   
+  def _handle_gateway_error(self, error):
+    self.disconnect()
+    if error.command == 8 and error.status != 10 and error.identifier != 0:
+      invalid_item = self._sent_items.get(ge.identifier)
+      if invalid_item:
+        self._log(logging.INFO, "invalid token: %s" % invalid_item[1])
+      self._retry_from(ge.identifier + 1)
+    else:
+      self._log(logging.WARN, "unknown error: %r" % error)
+
+  def _handle_ioerror(self, error):
+    self.disconnect()
+    self._log(logging.WARN, error, exc_info=1)
+
   def _send(self, notification, token):
     fileno = self.fileno()
     rfds, wfds, efds = [fileno], [fileno], [fileno]
@@ -352,38 +388,42 @@ class GatewayConnection(APNsConnection):
       ready_to_read, ready_to_write, in_error = select.select(rfds, wfds, efds, 60)
       if in_error:
         raise IOError("error")
-      if ready_to_read:
+      elif ready_to_read:
         self._ready_to_read()
-      if ready_to_write:
+      elif ready_to_write:
         self._ready_to_write(notification, token)
-        self._log(logging.DEBUG, "sent")
-        break
+        return
   
+  def _put_sent_item(self, notification, token):
+    self._sent_items[self._identifiler] = (notification, token, )
+    if len(self._sent_items) > self.KEEP_SENT_ITEMS_MAX:
+      self._sent_items.pop(self._identifiler - self.KEEP_SENT_ITEMS_MAX)
+
+  def _retry_last_one(self, index):
+    self._retry_from(self._identifiler)
+
+  def _retry_from(self, index):
+    while index <= self._identifiler:
+      item = self._sent_items.get(index)
+      if not item:
+        break
+      self.put(item[0], item[1])
+      index += 1
+
   def _ready_to_write(self, notification, token):
     notification.identifier = self._identifiler
-    self._send_notification_to_token(notification, token)
-    self._sent_items.append((notification, token, ))
-    assert self._identifiler == len(self._sent_items)
+    self._put_sent_item(notification, token)
     self._identifiler += 1
+    self._send_notification_to_token(notification, token)
+    self._log(logging.DEBUG, "sent")
   
   def _ready_to_read(self):
     self.recv()
-    data = self.read()
-    if not data or len(data) < 6:
+    if self.len_read_buffer() < 6:
       return
-    
-    command, status, identifier = struct.unpack("!BBL", data)
-    if command != 8:
-      raise IOError("APNs error: unknown command %d" % command)
-    
-    if identifier == 0:
-      raise IOError("APNs error: invalid identifier")
-    
-    for index in xrange(identifier, len(self._sent_items)):
-      item = self._sent_items[index]
-      self.put(item[0], item[1])
-    
-    raise IOError("APNs error: status is %d" % status)
+    data = self.read()
+    assert len(data) >= 6
+    raise GatewayError(data)
   
   def _send_notification_to_token(self, notification, token_hex):
     msg = self._build_message(notification, token_hex)
