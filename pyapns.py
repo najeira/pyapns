@@ -40,9 +40,9 @@ import select
 import ssl
 import json
 import logging
-import collections
 import threading
 import Queue
+import array
 
 
 MAX_NOTIFICATION_LENGTH = 256
@@ -320,41 +320,42 @@ class GatewayConnection(APNsConnection):
     self.server = "gateway.sandbox.push.apple.com" if use_sandbox else "gateway.push.apple.com"
     self.port = 2195
     self.logger = None
-    self._identifiler = 0
+    self.keep_sent_items_max = 1000
+    self._identifier = 0
     self._sent_items = {}
+    self._sent_identifiers = array.array("L")
     self._queue = Queue.Queue()
-    self._worker_thread = None
+    self._worker_thread = threading.Thread(target=self._run)
+    self._worker_thread.daemon = True
+    self._worker_thread.start()
   
   def put(self, notification, token):
+    if not self._worker_thread:
+      raise Error("closed")
     self._queue.put((notification, token, ))
     self._log(logging.DEBUG, "put")
-    self._start()
   
   def join(self):
     self._queue.put(None)
     if self._worker_thread:
       self._worker_thread.join()
       self._worker_thread = None
+
+  @property
+  def is_alive(self):
+    return not self._worker_thread
   
   def _log(self, level, msg, *args, **kwargs):
     if self.logger:
       self.logger.log(level, msg, *args, **kwargs)
   
-  def _start(self):
-    if self._worker_thread:
-      if not self._worker_thread.is_alive:
-        self._worker_thread = None
-    if not self._worker_thread:
-      self._worker_thread = threading.Thread(target=self._run)
-      self._worker_thread.daemon = True
-      self._worker_thread.start()
-      self._log(logging.DEBUG, "thread start")
-  
   def _run(self):
+    self._log(logging.DEBUG, "thread start")
     try:
       self._send_loop()
     finally:
       self.disconnect()
+      self._worker_thread = None
 
   def _send_loop(self):
     item = self._queue.get()
@@ -365,25 +366,32 @@ class GatewayConnection(APNsConnection):
         self._handle_gateway_error(gateway_error)
       except (socket.error, IOError) as io_error:
         self._handle_ioerror(io_error)
+      finally:
+        self._queue.task_done()
       item = self._queue.get()
+    self._queue.task_done()
   
   def _handle_gateway_error(self, error):
     self.disconnect()
     if error.command == 8 and error.identifier != 0:
-      invalid_item = self._sent_items.get(error.identifier)
+      invalid_item = self._pop_sent_item(error.identifier)
       if invalid_item:
         self._log(logging.INFO, "invalid token: %s" % invalid_item[1])
       self._retry_from(error.identifier + 1)
     else:
       self._log(logging.WARN, "unknown error: %r" % error)
+      raise
 
   def _handle_ioerror(self, error):
-    self.disconnect()
     self._log(logging.WARN, error)
+    if not self._socket:
+      raise # could not connect
+    self.disconnect()
+    self.ensure_connect() # try to connect, if failure then error will be raised
 
   def _send(self, notification, token):
-    self._identifiler += 1
-    notification.identifier = self._identifiler
+    self._identifier += 1
+    notification.identifier = self._identifier
     self._put_sent_item(notification, token)
     msg = self._build_message(notification, token)
     fileno = self.fileno()
@@ -400,12 +408,23 @@ class GatewayConnection(APNsConnection):
   
   def _put_sent_item(self, notification, token):
     self._sent_items[notification.identifier] = (notification, token, )
-    if len(self._sent_items) > self.KEEP_SENT_ITEMS_MAX:
-      self._sent_items.pop(notification.identifier - self.KEEP_SENT_ITEMS_MAX)
+    self._sent_identifiers.append(notification.identifier)
+    if len(self._sent_items) > self.keep_sent_items_max:
+      self._pop_sent_item_min()
+
+  def _pop_sent_item(self, index):
+    item = self._sent_items.pop(index, None)
+    if item:
+      self._sent_identifiers.remove(index)
+    return item
+
+  def _pop_sent_item_min(self):
+    index = self._sent_identifiers.pop(0)
+    return self._sent_items.pop(index, None)
 
   def _retry_from(self, index):
-    while index <= self._identifiler:
-      item = self._sent_items.pop(index, None)
+    while index <= self._identifier:
+      item = self._pop_sent_item(index)
       if item:
         self.put(item[0], item[1])
       index += 1
