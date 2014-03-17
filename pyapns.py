@@ -370,7 +370,6 @@ class GatewayConnection(APNsConnection):
       self._check_error()
     except GatewayError as gateway_error:
       self._handle_gateway_error(gateway_error)
-      self._queue.put(None)
     except (socket.error, IOError) as io_error:
       self._handle_ioerror(io_error)
   
@@ -381,6 +380,7 @@ class GatewayConnection(APNsConnection):
       if invalid_item:
         self._log(logging.INFO, "invalid token: %s" % invalid_item[1])
       self._retry_from(error.identifier + 1)
+      self._queue.put(None)
     else:
       self._log(logging.WARN, "unknown error: %r" % error)
       raise
