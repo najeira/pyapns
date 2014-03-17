@@ -347,6 +347,7 @@ class GatewayConnection(APNsConnection):
       self._send_loop()
       while not self._queue.empty():
         self._log(logging.DEBUG, "loop")
+        self._queue.put(None)
         self._send_loop()
     finally:
       #self.disconnect()
@@ -380,7 +381,6 @@ class GatewayConnection(APNsConnection):
       if invalid_item:
         self._log(logging.INFO, "invalid token: %s" % invalid_item[1])
       self._retry_from(error.identifier + 1)
-      self._queue.put(None)
     else:
       self._log(logging.WARN, "unknown error: %r" % error)
       raise
