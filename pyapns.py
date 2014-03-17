@@ -375,7 +375,7 @@ class GatewayConnection(APNsConnection):
   
   def _handle_gateway_error(self, error):
     self.disconnect()
-    if error.command == 8 and error.identifier != 0:
+    if error.command == 8 and error.identifier != 0 and error.status in (8, 10):
       invalid_item = self._pop_sent_item(error.identifier)
       if invalid_item:
         self._log(logging.INFO, "invalid token: %s" % invalid_item[1])
