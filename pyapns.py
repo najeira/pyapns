@@ -122,9 +122,6 @@ class APNsConnection(object):
     self._ssl = None
     self._read_buffer = []
 
-  def __del__(self):
-    self.disconnect()
-
   def _connect(self):
     self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     self._socket.connect((self.server, self.port))
@@ -140,10 +137,6 @@ class APNsConnection(object):
   def ensure_connect(self):
     if not self._socket:
       self._connect()
-  
-  def connection(self):
-    self.ensure_connect()
-    return self._ssl or self._socket
   
   def fileno(self):
     self.ensure_connect()
@@ -164,13 +157,15 @@ class APNsConnection(object):
     return self._socket.recv(n)
 
   def recv_to_buffer(self, n=4096):
-    chunk = self._recv(n)
+    chunk = self.recv(n)
     if not chunk:
       raise IOError("closed")
     self._read_buffer.append(chunk)
 
   def write(self, string):
-    return self.connection().write(string)
+    if self._ssl:
+      return self._ssl.write(string)
+    return self._socket.send(string)
 
 
 class NotificationAlert(object):
@@ -249,22 +244,19 @@ class Notification(object):
     return "\2" + len_str + payload_str
   
   def item_identifier(self):
-    if self.identifier is not None:
-      value = struct.pack(">I", self.identifier) # 4 bytes
-      len_str = struct.pack(">H", len(value)) # 2 bytes
-      return "\3" + len_str + value
+    value = struct.pack(">I", self.identifier or 0) # 4 bytes
+    len_str = struct.pack(">H", len(value)) # 2 bytes
+    return "\3" + len_str + value
   
   def item_expiration(self):
-    if self.expiration is not None:
-      value = struct.pack(">I", self.expiration) # 4 bytes
-      len_str = struct.pack(">H", len(value)) # 2 bytes
-      return "\4" + len_str + value
+    value = struct.pack(">I", self.expiration or 0) # 4 bytes
+    len_str = struct.pack(">H", len(value)) # 2 bytes
+    return "\4" + len_str + value
   
   def item_priority(self):
-    if self.priority is not None:
-      value = struct.pack(">B", self.priority) # 1 bytes
-      len_str = struct.pack(">H", len(value)) # 2 bytes
-      return "\5" + len_str + value
+    value = struct.pack(">B", self.priority or 10) # 1 bytes
+    len_str = struct.pack(">H", len(value)) # 2 bytes
+    return "\5" + len_str + value
 
 
 class FeedbackConnection(APNsConnection):
@@ -353,8 +345,11 @@ class GatewayConnection(APNsConnection):
     self._log(logging.DEBUG, "thread start")
     try:
       self._send_loop()
+      while not self._queue.empty():
+        self._log(logging.DEBUG, "loop")
+        self._send_loop()
     finally:
-      self.disconnect()
+      #self.disconnect()
       self._worker_thread = None
 
   def _send_loop(self):
@@ -370,6 +365,14 @@ class GatewayConnection(APNsConnection):
         self._queue.task_done()
       item = self._queue.get()
     self._queue.task_done()
+    
+    try:
+      self._check_error()
+    except GatewayError as gateway_error:
+      self._handle_gateway_error(gateway_error)
+      self._queue.put(None)
+    except (socket.error, IOError) as io_error:
+      self._handle_ioerror(io_error)
   
   def _handle_gateway_error(self, error):
     self.disconnect()
@@ -383,11 +386,9 @@ class GatewayConnection(APNsConnection):
       raise
 
   def _handle_ioerror(self, error):
-    self._log(logging.WARN, error)
-    if not self._socket:
-      raise # could not connect
     self.disconnect()
-    self.ensure_connect() # try to connect, if failure then error will be raised
+    self._log(logging.WARN, error)
+    self.ensure_connect()
 
   def _send(self, notification, token):
     self._identifier += 1
@@ -405,6 +406,15 @@ class GatewayConnection(APNsConnection):
       elif ready_to_write:
         msg = self._ready_to_write(msg)
     self._log(logging.DEBUG, "sent")
+
+  def _check_error(self):
+    fileno = self.fileno()
+    rfds, wfds, efds = [fileno], [], [fileno]
+    ready_to_read, ready_to_write, in_error = select.select(rfds, wfds, efds, 0.5)
+    if in_error:
+      raise IOError("error")
+    elif ready_to_read:
+      self._ready_to_read()
   
   def _put_sent_item(self, notification, token):
     self._sent_items[notification.identifier] = (notification, token, )
@@ -448,13 +458,8 @@ class GatewayConnection(APNsConnection):
   
   def _build_message(self, notification, token_hex):
     data = [self._item_device_token(utf8(token_hex)),
-      notification.item_payload()]
-    for f in (notification.item_identifier,
-              notification.item_expiration,
-              notification.item_priority):
-      item = f()
-      if item:
-        data.append(item)
+      notification.item_payload(), notification.item_identifier(),
+      notification.item_expiration(), notification.item_priority()]
     data = "".join(data)
     len_str = struct.pack(">I", len(data)) # 4 bytes
     return "\2" + len_str + data
