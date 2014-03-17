@@ -13,7 +13,11 @@ server = apns.gateway_server
 
 # sends a notification
 notification = Notification(alert="This is APNs message!")
-server.send(notification, device_tokens)
+server.put(notification, device_token1)
+server.put(notification, device_token2)
+
+# wait
+server.join()
 ```
 
 ### Handling feedbacks
