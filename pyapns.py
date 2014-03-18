@@ -46,6 +46,10 @@ import array
 
 
 MAX_NOTIFICATION_LENGTH = 256
+POLL_NONE  = 0
+POLL_READ  = 0x001
+POLL_WRITE = 0x004
+POLL_ERROR = 0x008 | 0x010
 
 
 def utf8(value):
@@ -111,6 +115,7 @@ class APNsConnection(object):
   """
   A generic connection class for communicating with the APNs
   """
+  POLL_EVENTS = 0
 
   def __init__(self, cert_file=None, key_file=None):
     super(APNsConnection, self).__init__()
@@ -121,14 +126,35 @@ class APNsConnection(object):
     self._socket = None
     self._ssl = None
     self._read_buffer = []
+    if hasattr(select, "epoll"):
+      # Linux
+      self._poll = select.epoll()
+    elif hasattr(select, "kqueue"):
+      # Python 2.6+ on BSD or Mac
+      self._poll = _KQueue()
+    else:
+      self._poll = _Select()
+
+  def poll(self, timeout):
+    self.ensure_connect()
+    return self._poll.poll(timeout)
+
+  def poll_modify(self, events):
+    self.ensure_connect()
+    self._poll.modify(self._socket.fileno(), events | POLL_ERROR)
 
   def _connect(self):
     self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     self._socket.connect((self.server, self.port))
     self._ssl = ssl.wrap_socket(self._socket, self.key_file, self.cert_file)
+    self._poll.register(self._socket.fileno(), self.POLL_EVENTS | POLL_ERROR)
 
   def disconnect(self):
     if self._socket:
+      try:
+        self._poll.unregister(self._socket.fileno())
+      except Exception as ex:
+        pass
       self._socket.close()
       self._socket = None
       self._ssl = None
@@ -137,10 +163,6 @@ class APNsConnection(object):
   def ensure_connect(self):
     if not self._socket:
       self._connect()
-  
-  def fileno(self):
-    self.ensure_connect()
-    return self._socket.fileno()
   
   def len_read_buffer(self):
     return sum(len(b) for b in self._read_buffer)
@@ -151,7 +173,6 @@ class APNsConnection(object):
     return data
   
   def recv(self, n=4096):
-    self.ensure_connect()
     if self._ssl:
       return self._ssl.read(n)
     return self._socket.recv(n)
@@ -263,6 +284,7 @@ class FeedbackConnection(APNsConnection):
   """
   A class representing a connection to the APNs Feedback server
   """
+  POLL_EVENTS = POLL_READ
 
   def __init__(self, use_sandbox=False, **kwargs):
     super(FeedbackConnection, self).__init__(**kwargs)
@@ -275,15 +297,10 @@ class FeedbackConnection(APNsConnection):
     the APNs feedback server
     """
     buff = ""
-    fileno = self.fileno()
-    rfds, wfds, efds = [fileno], [], [fileno]
-    while True:
-      ready_to_read, _, in_error = select.select(rfds, wfds, efds, 60)
-      
-      if len(in_error):
+    for (fd, events) in self.poll(60.0):
+      if events & POLL_ERROR:
         raise IOError("error")
-      
-      if len(ready_to_read):
+      elif events & POLL_READ:
         self.recv_to_buffer()
         data = self.read()
         if not data or len(buff) < 6:
@@ -306,6 +323,7 @@ class GatewayConnection(APNsConnection):
   """
   A class that represents a connection to the APNs gateway server
   """
+  POLL_EVENTS = POLL_READ | POLL_WRITE
 
   def __init__(self, use_sandbox=False, **kwargs):
     super(GatewayConnection, self).__init__(**kwargs)
@@ -335,14 +353,13 @@ class GatewayConnection(APNsConnection):
 
   @property
   def is_alive(self):
-    return not self._worker_thread
+    return bool(self._worker_thread)
   
   def _log(self, level, msg, *args, **kwargs):
     if self.logger:
       self.logger.log(level, msg, *args, **kwargs)
   
   def _run(self):
-    self._log(logging.DEBUG, "thread start")
     try:
       self._send_loop()
       while not self._queue.empty():
@@ -350,7 +367,7 @@ class GatewayConnection(APNsConnection):
         self._queue.put(None)
         self._send_loop()
     finally:
-      #self.disconnect()
+      self.disconnect()
       self._worker_thread = None
 
   def _send_loop(self):
@@ -367,8 +384,10 @@ class GatewayConnection(APNsConnection):
       item = self._queue.get()
     self._queue.task_done()
     
+    self.poll_modify(POLL_READ)
     try:
       self._check_error()
+      self.poll_modify(self.POLL_EVENTS)
     except GatewayError as gateway_error:
       self._handle_gateway_error(gateway_error)
     except (socket.error, IOError) as io_error:
@@ -388,33 +407,28 @@ class GatewayConnection(APNsConnection):
   def _handle_ioerror(self, error):
     self.disconnect()
     self._log(logging.WARN, error)
-    self.ensure_connect()
 
   def _send(self, notification, token):
     self._identifier += 1
     notification.identifier = self._identifier
     self._put_sent_item(notification, token)
     msg = self._build_message(notification, token)
-    fileno = self.fileno()
-    rfds, wfds, efds = [fileno], [fileno], [fileno]
     while msg:
-      ready_to_read, ready_to_write, in_error = select.select(rfds, wfds, efds)
-      if in_error:
-        raise IOError("error")
-      elif ready_to_read:
-        self._ready_to_read()
-      elif ready_to_write:
-        msg = self._ready_to_write(msg)
+      for (fd, events) in self.poll(3600.0):
+        if events & POLL_ERROR:
+          raise IOError("error")
+        elif events & POLL_READ:
+          self._ready_to_read()
+        elif events & POLL_WRITE:
+          msg = self._ready_to_write(msg)
     self._log(logging.DEBUG, "sent")
 
   def _check_error(self):
-    fileno = self.fileno()
-    rfds, wfds, efds = [fileno], [], [fileno]
-    ready_to_read, ready_to_write, in_error = select.select(rfds, wfds, efds, 0.5)
-    if in_error:
-      raise IOError("error")
-    elif ready_to_read:
-      self._ready_to_read()
+    for (fd, events) in self.poll(0.5):
+      if events & POLL_ERROR:
+        raise IOError("error")
+      elif events & POLL_READ:
+        self._ready_to_read()
   
   def _put_sent_item(self, notification, token):
     self._sent_items[notification.identifier] = (notification, token, )
@@ -468,3 +482,116 @@ class GatewayConnection(APNsConnection):
     token_bin = binascii.a2b_hex(token_hex)
     len_str = struct.pack(">H", len(token_bin)) # 2 bytes
     return "\1" + len_str + token_bin
+
+
+class _KQueue(object):
+  """A kqueue-based event loop for BSD/Mac systems."""
+
+  def __init__(self):
+    self._kqueue = select.kqueue()
+    self._active = {}
+
+  def fileno(self):
+    return self._kqueue.fileno()
+
+  def close(self):
+    self._kqueue.close()
+
+  def register(self, fd, events):
+    if fd in self._active:
+      raise IOError("fd %d already registered" % fd)
+    self._control(fd, events, select.KQ_EV_ADD)
+    self._active[fd] = events
+
+  def modify(self, fd, events):
+    self.unregister(fd)
+    self.register(fd, events)
+
+  def unregister(self, fd):
+    events = self._active.pop(fd)
+    self._control(fd, events, select.KQ_EV_DELETE)
+
+  def _control(self, fd, events, flags):
+    kevents = []
+    if events & POLL_WRITE:
+      kevents.append(select.kevent(
+        fd, filter=select.KQ_FILTER_WRITE, flags=flags))
+    if events & POLL_READ or not kevents:
+      # Always read when there is not a write
+      kevents.append(select.kevent(
+        fd, filter=select.KQ_FILTER_READ, flags=flags))
+    # Even though control() takes a list, it seems to return EINVAL
+    # on Mac OS X (10.6) when there is more than one event in the list.
+    for kevent in kevents:
+      self._kqueue.control([kevent], 0)
+
+  def poll(self, timeout):
+    kevents = self._kqueue.control(None, 1000, timeout)
+    events = {}
+    for kevent in kevents:
+      fd = kevent.ident
+      if kevent.filter == select.KQ_FILTER_READ:
+        events[fd] = events.get(fd, 0) | POLL_READ
+      if kevent.filter == select.KQ_FILTER_WRITE:
+        if kevent.flags & select.KQ_EV_EOF:
+          # If an asynchronous connection is refused, kqueue
+          # returns a write event with the EOF flag set.
+          # Turn this into an error for consistency with the
+          # other IOLoop implementations.
+          # Note that for read events, EOF may be returned before
+          # all data has been consumed from the socket buffer,
+          # so we only check for EOF on write events.
+          events[fd] = POLL_ERROR
+        else:
+          events[fd] = events.get(fd, 0) | POLL_WRITE
+      if kevent.flags & select.KQ_EV_ERROR:
+        events[fd] = events.get(fd, 0) | POLL_ERROR
+    return events.items()
+
+
+class _Select(object):
+  """A simple, select()-based IOLoop implementation for non-Linux systems"""
+
+  def __init__(self):
+    self.read_fds = set()
+    self.write_fds = set()
+    self.error_fds = set()
+    self.fd_sets = (self.read_fds, self.write_fds, self.error_fds)
+
+  def close(self):
+    pass
+
+  def register(self, fd, events):
+    if fd in self.read_fds or fd in self.write_fds or fd in self.error_fds:
+      raise IOError("fd %d already registered" % fd)
+    if events & POLL_READ:
+      self.read_fds.add(fd)
+    if events & POLL_WRITE:
+      self.write_fds.add(fd)
+    if events & POLL_ERROR:
+      self.error_fds.add(fd)
+      # Closed connections are reported as errors by epoll and kqueue,
+      # but as zero-byte reads by select, so when errors are requested
+      # we need to listen for both read and error.
+      self.read_fds.add(fd)
+
+  def modify(self, fd, events):
+    self.unregister(fd)
+    self.register(fd, events)
+
+  def unregister(self, fd):
+    self.read_fds.discard(fd)
+    self.write_fds.discard(fd)
+    self.error_fds.discard(fd)
+
+  def poll(self, timeout):
+    readable, writeable, errors = select.select(
+      self.read_fds, self.write_fds, self.error_fds, timeout)
+    events = {}
+    for fd in readable:
+      events[fd] = events.get(fd, 0) | POLL_READ
+    for fd in writeable:
+      events[fd] = events.get(fd, 0) | POLL_WRITE
+    for fd in errors:
+      events[fd] = events.get(fd, 0) | POLL_ERROR
+    return events.items()

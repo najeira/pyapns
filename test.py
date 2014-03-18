@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import sys
+import time
 import socket
 import select
 import logging
@@ -9,7 +10,7 @@ from SocketServer import TCPServer
 from SocketServer import StreamRequestHandler
 from struct import pack, unpack
 from binascii import a2b_hex, b2a_hex
-from pyapns import GatewayConnection, Notification
+from pyapns import GatewayConnection, Notification, POLL_ERROR
 
 PORT = 2195
 
@@ -134,6 +135,7 @@ class TestGatewayConnection(GatewayConnection):
   def _connect(self):
     self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     self._socket.connect((self.server, self.port))
+    self._poll.register(self._socket.fileno(), self.POLL_EVENTS | POLL_ERROR)
 
 def start_server(server):
   try:
@@ -152,6 +154,7 @@ def test():
   gw.put(Notification(alert=u"こんにちは"), b2a_hex(packed_uint_big_endian(2)))
   gw.put(Notification(alert=u"エラーになる"), b2a_hex(packed_uint_big_endian(10)))
   gw.put(Notification(alert=u"リトライされる"), b2a_hex(packed_uint_big_endian(3)))
+  time.sleep(1.0)
   gw.put(Notification(alert=u"リトライされる2"), b2a_hex(packed_uint_big_endian(4)))
   
   gw.join()
