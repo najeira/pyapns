@@ -407,6 +407,7 @@ class GatewayConnection(APNsConnection):
   def _handle_ioerror(self, error):
     self.disconnect()
     self._log(logging.WARN, error)
+    self.ensure_connect()
 
   def _send(self, notification, token):
     self._identifier += 1
